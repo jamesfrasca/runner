@@ -57,6 +57,13 @@ namespace GitHub.Runner.Common
             return await ExecuteAsync("operation", operation, cancellationToken);
         }
 
+        public async Task<T> ExecuteAsync<T>(
+            Func<RetryExecutionContext, Task<T>> operation,
+            CancellationToken cancellationToken = default)
+        {
+            return await ExecuteAsync("operation", operation, cancellationToken);
+        }
+
         public async Task ExecuteAsync(
             Func<Task> operation,
             CancellationToken cancellationToken = default)
@@ -64,9 +71,48 @@ namespace GitHub.Runner.Common
             ArgUtil.NotNull(operation, nameof(operation));
             await ExecuteAsync(
                 "operation",
-                async () =>
+                async _ =>
                 {
                     await operation();
+                    return true;
+                },
+                cancellationToken);
+        }
+
+        public async Task ExecuteAsync(
+            Func<RetryExecutionContext, Task> operation,
+            CancellationToken cancellationToken = default)
+        {
+            await ExecuteAsync("operation", operation, cancellationToken);
+        }
+
+        public async Task ExecuteAsync(
+            string operationName,
+            Func<Task> operation,
+            CancellationToken cancellationToken = default)
+        {
+            ArgUtil.NotNull(operation, nameof(operation));
+            await ExecuteAsync(
+                operationName,
+                async _ =>
+                {
+                    await operation();
+                    return true;
+                },
+                cancellationToken);
+        }
+
+        public async Task ExecuteAsync(
+            string operationName,
+            Func<RetryExecutionContext, Task> operation,
+            CancellationToken cancellationToken = default)
+        {
+            ArgUtil.NotNull(operation, nameof(operation));
+            await ExecuteAsync(
+                operationName,
+                async context =>
+                {
+                    await operation(context);
                     return true;
                 },
                 cancellationToken);
@@ -75,6 +121,15 @@ namespace GitHub.Runner.Common
         public async Task<T> ExecuteAsync<T>(
             string operationName,
             Func<Task<T>> operation,
+            CancellationToken cancellationToken = default)
+        {
+            ArgUtil.NotNull(operation, nameof(operation));
+            return await ExecuteAsync(operationName, _ => operation(), cancellationToken);
+        }
+
+        public async Task<T> ExecuteAsync<T>(
+            string operationName,
+            Func<RetryExecutionContext, Task<T>> operation,
             CancellationToken cancellationToken = default)
         {
             ArgUtil.NotNull(operation, nameof(operation));
@@ -92,7 +147,7 @@ namespace GitHub.Runner.Common
 
                 try
                 {
-                    var result = await operation();
+                    var result = await operation(context);
                     _strategy.OnSuccess?.Invoke(context, stopwatch.Elapsed);
                     return result;
                 }

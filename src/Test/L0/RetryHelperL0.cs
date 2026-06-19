@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -259,6 +260,38 @@ namespace GitHub.Runner.Common.Tests
                 Assert.Equal(1, capturedContext.AttemptNumber);
                 Assert.IsType<ArgumentException>(capturedException);
                 Assert.True(capturedDuration >= TimeSpan.Zero);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public async Task ExecuteAsync_PassesContextToOperationCallback()
+        {
+            using (TestHostContext hc = CreateTestContext())
+            {
+                var trace = hc.GetTrace();
+                var seenAttempts = new List<int>();
+                var strategy = new RetryStrategy
+                {
+                    MaxAttempts = 3,
+                    GetBackoff = (_, _, _) => TimeSpan.Zero,
+                };
+
+                var helper = new RetryHelper(trace, strategy);
+                var result = await helper.ExecuteAsync<int>("context-op", context =>
+                {
+                    seenAttempts.Add(context.AttemptNumber);
+                    if (context.AttemptNumber < context.MaxAttempts)
+                    {
+                        throw new InvalidOperationException("transient");
+                    }
+
+                    return Task.FromResult(context.AttemptNumber);
+                });
+
+                Assert.Equal(3, result);
+                Assert.Equal(new[] { 1, 2, 3 }, seenAttempts);
             }
         }
 
