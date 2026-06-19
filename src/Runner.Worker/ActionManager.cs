@@ -767,29 +767,30 @@ namespace GitHub.Runner.Worker
 
             // Pull down docker image with retry up to 3 times
             var dockerManager = HostContext.GetService<IDockerCommandManager>();
-            int retryCount = 0;
             int pullExitCode = 0;
-            while (retryCount < 3)
+            var pullRetryHelper = new RetryHelper(Trace, new RetryStrategy
             {
-                pullExitCode = await dockerManager.DockerPull(executionContext, setupInfo.Container.Image);
-                if (pullExitCode == 0)
+                MaxAttempts = 3,
+                GetBackoff = (_, _, _) => BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(10)),
+                OnRetry = (_, _, backoff) =>
                 {
-                    break;
-                }
-                else
+                    executionContext.Warning($"Docker pull failed with exit code {pullExitCode}, back off {backoff.TotalSeconds} seconds before retry.");
+                },
+            });
+
+            await pullRetryHelper.ExecuteAsync(
+                operationName: nameof(PullActionContainerAsync),
+                operation: async () =>
                 {
-                    retryCount++;
-                    if (retryCount < 3)
-                    {
-                        var backOff = BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(10));
-                        executionContext.Warning($"Docker pull failed with exit code {pullExitCode}, back off {backOff.TotalSeconds} seconds before retry.");
-                        await Task.Delay(backOff);
-                    }
-                }
-            }
+                    pullExitCode = await dockerManager.DockerPull(executionContext, setupInfo.Container.Image);
+                    return pullExitCode == 0
+                        ? OperationOutcome.Success(true)
+                        : OperationOutcome.TransientFailure<bool>($"Docker pull failed with exit code {pullExitCode}");
+                },
+                cancellationToken: executionContext.CancellationToken);
             executionContext.Output("##[endgroup]");
 
-            if (retryCount == 3 && pullExitCode != 0)
+            if (pullExitCode != 0)
             {
                 throw new InvalidOperationException($"Docker pull failed with exit code {pullExitCode}");
             }
@@ -811,35 +812,37 @@ namespace GitHub.Runner.Worker
 
             // Build docker image with retry up to 3 times
             var dockerManager = HostContext.GetService<IDockerCommandManager>();
-            int retryCount = 0;
             int buildExitCode = 0;
             var imageName = $"{dockerManager.DockerInstanceLabel}:{Guid.NewGuid().ToString("N")}";
-            while (retryCount < 3)
+            var buildRetryHelper = new RetryHelper(Trace, new RetryStrategy
             {
-                buildExitCode = await dockerManager.DockerBuild(
-                    executionContext,
-                    setupInfo.Container.WorkingDirectory,
-                    setupInfo.Container.Dockerfile,
-                    Directory.GetParent(setupInfo.Container.Dockerfile).FullName,
-                    imageName);
-                if (buildExitCode == 0)
+                MaxAttempts = 3,
+                GetBackoff = (_, _, _) => BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(10)),
+                OnRetry = (_, _, backoff) =>
                 {
-                    break;
-                }
-                else
+                    executionContext.Warning($"Docker build failed with exit code {buildExitCode}, back off {backoff.TotalSeconds} seconds before retry.");
+                },
+            });
+
+            await buildRetryHelper.ExecuteAsync(
+                operationName: nameof(BuildActionContainerAsync),
+                operation: async () =>
                 {
-                    retryCount++;
-                    if (retryCount < 3)
-                    {
-                        var backOff = BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(10));
-                        executionContext.Warning($"Docker build failed with exit code {buildExitCode}, back off {backOff.TotalSeconds} seconds before retry.");
-                        await Task.Delay(backOff);
-                    }
-                }
-            }
+                    buildExitCode = await dockerManager.DockerBuild(
+                        executionContext,
+                        setupInfo.Container.WorkingDirectory,
+                        setupInfo.Container.Dockerfile,
+                        Directory.GetParent(setupInfo.Container.Dockerfile).FullName,
+                        imageName);
+
+                    return buildExitCode == 0
+                        ? OperationOutcome.Success(true)
+                        : OperationOutcome.TransientFailure<bool>($"Docker build failed with exit code {buildExitCode}");
+                },
+                cancellationToken: executionContext.CancellationToken);
             executionContext.Output("##[endgroup]");
 
-            if (retryCount == 3 && buildExitCode != 0)
+            if (buildExitCode != 0)
             {
                 throw new InvalidOperationException($"Docker build failed with exit code {buildExitCode}");
             }
