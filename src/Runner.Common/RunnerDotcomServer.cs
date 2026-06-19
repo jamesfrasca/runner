@@ -111,19 +111,30 @@ namespace GitHub.Runner.Common
 
         private async Task<T> RetryRequest<T>(string githubApiUrl, string githubToken, RequestType requestType, int maxRetryAttemptsCount = 5, string errorMessage = null, StringContent body = null)
         {
-            int retry = 0;
-            while (true)
+            var responseStatus = System.Net.HttpStatusCode.OK;
+            var retryHelper = new RetryHelper(Trace, new RetryStrategy
             {
-                retry++;
-                using (var httpClientHandler = HostContext.CreateHttpClientHandler())
-                using (var httpClient = new HttpClient(httpClientHandler))
+                MaxAttempts = maxRetryAttemptsCount,
+                ShouldRetry = _ => responseStatus != System.Net.HttpStatusCode.NotFound,
+                GetBackoff = (_, _, _) => BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5)),
+                OnRetry = (context, ex, backoff) =>
                 {
-                    httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("RemoteAuth", githubToken);
-                    httpClient.DefaultRequestHeaders.UserAgent.AddRange(HostContext.UserAgents);
+                    Trace.Error($"{errorMessage} -- Attempt: {context.AttemptNumber}");
+                    Trace.Error(ex);
+                    Trace.Info($"Retrying in {backoff.Seconds} seconds");
+                },
+            });
 
-                    var responseStatus = System.Net.HttpStatusCode.OK;
-                    try
+            return await retryHelper.ExecuteAsync(
+                operationName: "RunnerDotcomServer.RetryRequest",
+                operation: async () =>
+                {
+                    using (var httpClientHandler = HostContext.CreateHttpClientHandler())
+                    using (var httpClient = new HttpClient(httpClientHandler))
                     {
+                        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("RemoteAuth", githubToken);
+                        httpClient.DefaultRequestHeaders.UserAgent.AddRange(HostContext.UserAgents);
+
                         HttpResponseMessage response = null;
                         switch (requestType)
                         {
@@ -163,17 +174,9 @@ namespace GitHub.Runner.Common
                             }
                         }
 
+                        throw new InvalidOperationException($"Unable to process response from '{requestType} {githubApiUrl}'.");
                     }
-                    catch (Exception ex) when (retry < maxRetryAttemptsCount && responseStatus != System.Net.HttpStatusCode.NotFound)
-                    {
-                        Trace.Error($"{errorMessage} -- Attempt: {retry}");
-                        Trace.Error(ex);
-                    }
-                }
-                var backOff = BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5));
-                Trace.Info($"Retrying in {backOff.Seconds} seconds");
-                await Task.Delay(backOff);
-            }
+                });
         }
 
         private string GetEntityUrl(string githubUrl)

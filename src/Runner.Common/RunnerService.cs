@@ -88,25 +88,20 @@ namespace GitHub.Runner.Common
             Func<Exception, bool> shouldRetry = null
         )
         {
-            var attempt = 0;
-            while (true)
+            var retryHelper = new RetryHelper(Trace, new RetryStrategy
             {
-                attempt++;
-                cancellationToken.ThrowIfCancellationRequested();
-                try
-                {
-                    return await func();
-                }
-                // TODO: Add handling of non-retriable exceptions: https://github.com/github/actions-broker/issues/122
-                catch (Exception ex) when (attempt < maxAttempts && (shouldRetry == null || shouldRetry(ex)))
+                MaxAttempts = maxAttempts,
+                ShouldRetry = shouldRetry,
+                GetBackoff = (_, _, _) => BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(15)),
+                OnRetry = (context, ex, backoff) =>
                 {
                     Trace.Error("Catch exception during request");
                     Trace.Error(ex);
-                    var backOff = BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(15));
-                    Trace.Warning($"Back off {backOff.TotalSeconds} seconds before next retry. {maxAttempts - attempt} attempt left.");
-                    await Task.Delay(backOff, cancellationToken);
-                }
-            }
+                    Trace.Warning($"Back off {backoff.TotalSeconds} seconds before next retry. {context.MaxAttempts - context.AttemptNumber} attempt left.");
+                },
+            });
+
+            return await retryHelper.ExecuteAsync(func, cancellationToken);
         }
     }
 }

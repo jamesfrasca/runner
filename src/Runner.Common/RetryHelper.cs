@@ -1,0 +1,116 @@
+﻿using System;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
+using GitHub.Runner.Sdk;
+
+namespace GitHub.Runner.Common
+{
+    public sealed class RetryExecutionContext
+    {
+        public RetryExecutionContext(string operationName, int attemptNumber, int maxAttempts, DateTime startTimeUtc)
+        {
+            OperationName = operationName;
+            AttemptNumber = attemptNumber;
+            MaxAttempts = maxAttempts;
+            StartTimeUtc = startTimeUtc;
+        }
+
+        public string OperationName { get; }
+        public int AttemptNumber { get; }
+        public int MaxAttempts { get; }
+        public DateTime StartTimeUtc { get; }
+    }
+
+    public sealed class RetryStrategy
+    {
+        public int MaxAttempts { get; init; }
+        public Func<Exception, bool> ShouldRetry { get; init; }
+        public Func<int, int, Exception, TimeSpan> GetBackoff { get; init; }
+        public Action<RetryExecutionContext, Exception, TimeSpan> OnRetry { get; init; }
+        public Action<RetryExecutionContext, TimeSpan> OnSuccess { get; init; }
+        public Action<RetryExecutionContext, Exception, TimeSpan> OnFailure { get; init; }
+    }
+
+    public sealed class RetryHelper
+    {
+        private readonly Tracing _trace;
+        private readonly RetryStrategy _strategy;
+
+        public RetryHelper(Tracing trace, RetryStrategy strategy)
+        {
+            _trace = trace ?? throw new ArgumentNullException(nameof(trace));
+            _strategy = strategy ?? throw new ArgumentNullException(nameof(strategy));
+
+            ArgUtil.NotNull(strategy.GetBackoff, $"{nameof(strategy)}.{nameof(strategy.GetBackoff)}");
+
+            if (strategy.MaxAttempts <= 0)
+            {
+                throw new ArgumentOutOfRangeException($"{nameof(strategy)}.{nameof(strategy.MaxAttempts)}");
+            }
+        }
+
+        public async Task<T> ExecuteAsync<T>(
+            Func<Task<T>> operation,
+            CancellationToken cancellationToken = default)
+        {
+            return await ExecuteAsync("operation", operation, cancellationToken);
+        }
+
+        public async Task ExecuteAsync(
+            Func<Task> operation,
+            CancellationToken cancellationToken = default)
+        {
+            ArgUtil.NotNull(operation, nameof(operation));
+            await ExecuteAsync(
+                "operation",
+                async () =>
+                {
+                    await operation();
+                    return true;
+                },
+                cancellationToken);
+        }
+
+        public async Task<T> ExecuteAsync<T>(
+            string operationName,
+            Func<Task<T>> operation,
+            CancellationToken cancellationToken = default)
+        {
+            ArgUtil.NotNull(operation, nameof(operation));
+
+            operationName ??= "operation";
+
+            var attempt = 0;
+            var startTimeUtc = DateTime.UtcNow;
+            var stopwatch = Stopwatch.StartNew();
+            while (true)
+            {
+                attempt++;
+                cancellationToken.ThrowIfCancellationRequested();
+                var context = new RetryExecutionContext(operationName, attempt, _strategy.MaxAttempts, startTimeUtc);
+
+                try
+                {
+                    var result = await operation();
+                    _strategy.OnSuccess?.Invoke(context, stopwatch.Elapsed);
+                    return result;
+                }
+                catch (Exception ex)
+                {
+                    var shouldRetry = _strategy.ShouldRetry == null || _strategy.ShouldRetry(ex);
+                    if (attempt >= _strategy.MaxAttempts || !shouldRetry)
+                    {
+                        _trace.Error($"[{operationName}] retry exhausted at attempt {attempt}/{_strategy.MaxAttempts}");
+                        _strategy.OnFailure?.Invoke(context, ex, stopwatch.Elapsed);
+                        throw;
+                    }
+
+                    var backoff = _strategy.GetBackoff(attempt, _strategy.MaxAttempts, ex);
+                    _strategy.OnRetry?.Invoke(context, ex, backoff);
+                    await Task.Delay(backoff, cancellationToken);
+                }
+            }
+        }
+    }
+}
