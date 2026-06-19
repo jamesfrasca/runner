@@ -889,57 +889,66 @@ namespace GitHub.Runner.Worker
             var launchServer = HostContext.GetService<ILaunchServer>();
             var jobServer = HostContext.GetService<IJobServer>();
             var actionDownloadInfos = default(WebApi.ActionDownloadInfoCollection);
-            for (var attempt = 1; attempt <= 3; attempt++)
+            Exception nonRetryableResolveException = null;
+            var resolveInfoRetryHelper = new RetryHelper(Trace, new RetryStrategy
             {
-                try
+                MaxAttempts = 3,
+                GetBackoff = (_, _, _) => String.IsNullOrEmpty(Environment.GetEnvironmentVariable("_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF"))
+                    ? BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30))
+                    : TimeSpan.Zero,
+                OnRetry = (_, ex, backoff) =>
                 {
-                    if (MessageUtil.IsRunServiceJob(executionContext.Global.Variables.Get(Constants.Variables.System.JobRequestType)))
+                    executionContext.Output($"Failed to resolve action download info. Error: {ex.Message}");
+                    executionContext.Debug(ex.ToString());
+                    if (backoff > TimeSpan.Zero)
                     {
-                        var displayHelpfulActionsDownloadErrors = executionContext.Global.Variables.GetBoolean(Constants.Runner.Features.DisplayHelpfulActionsDownloadErrors) ?? false;
-                        actionDownloadInfos = await launchServer.ResolveActionsDownloadInfoAsync(executionContext.Global.Plan.PlanId, executionContext.Root.Id, new WebApi.ActionReferenceList { Actions = actionReferences, Dependencies = dependencies }, executionContext.CancellationToken, displayHelpfulActionsDownloadErrors);
+                        executionContext.Output($"Retrying in {backoff.TotalSeconds} seconds");
                     }
-                    else
-                    {
-                        actionDownloadInfos = await jobServer.ResolveActionDownloadInfoAsync(executionContext.Global.Plan.ScopeIdentifier, executionContext.Global.Plan.PlanType, executionContext.Global.Plan.PlanId, executionContext.Root.Id, new WebApi.ActionReferenceList { Actions = actionReferences }, executionContext.CancellationToken);
-                    }
-                    break;
-                }
-                catch (Exception ex) when (!executionContext.CancellationToken.IsCancellationRequested) // Do not retry if the run is cancelled.
+                },
+            });
+
+            var resolved = await resolveInfoRetryHelper.ExecuteAsync<bool>(
+                operationName: nameof(GetDownloadInfoAsync),
+                operation: async () =>
                 {
-                    // UnresolvableActionDownloadInfoException is a 422 client error, don't retry
-                    // NonRetryableActionDownloadInfoException is an non-retryable exception from Actions
-                    // Some possible cases are:
-                    // * Repo is rate limited
-                    // * Repo or tag doesn't exist, or isn't public
-                    // * Policy validation failed
-                    if (attempt < 3 && !(ex is WebApi.UnresolvableActionDownloadInfoException) && !(ex is WebApi.NonRetryableActionDownloadInfoException))
+                    try
                     {
-                        executionContext.Output($"Failed to resolve action download info. Error: {ex.Message}");
-                        executionContext.Debug(ex.ToString());
-                        if (String.IsNullOrEmpty(Environment.GetEnvironmentVariable("_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF")))
+                        if (MessageUtil.IsRunServiceJob(executionContext.Global.Variables.Get(Constants.Variables.System.JobRequestType)))
                         {
-                            var backoff = BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30));
-                            executionContext.Output($"Retrying in {backoff.TotalSeconds} seconds");
-                            await Task.Delay(backoff);
-                        }
-                    }
-                    else
-                    {
-                        // Some possible cases are:
-                        // * Repo is rate limited
-                        // * Repo or tag doesn't exist, or isn't public
-                        // * Policy validation failed
-                        if (ex is WebApi.UnresolvableActionDownloadInfoException)
-                        {
-                            throw;
+                            var displayHelpfulActionsDownloadErrors = executionContext.Global.Variables.GetBoolean(Constants.Runner.Features.DisplayHelpfulActionsDownloadErrors) ?? false;
+                            actionDownloadInfos = await launchServer.ResolveActionsDownloadInfoAsync(executionContext.Global.Plan.PlanId, executionContext.Root.Id, new WebApi.ActionReferenceList { Actions = actionReferences, Dependencies = dependencies }, executionContext.CancellationToken, displayHelpfulActionsDownloadErrors);
                         }
                         else
                         {
-                            // This exception will be traced as an infrastructure failure
-                            throw new WebApi.FailedToResolveActionDownloadInfoException("Failed to resolve action download info.", ex);
+                            actionDownloadInfos = await jobServer.ResolveActionDownloadInfoAsync(executionContext.Global.Plan.ScopeIdentifier, executionContext.Global.Plan.PlanType, executionContext.Global.Plan.PlanId, executionContext.Root.Id, new WebApi.ActionReferenceList { Actions = actionReferences }, executionContext.CancellationToken);
                         }
+                        return OperationOutcome.Success(true);
                     }
-                }
+                    catch (Exception ex) when (!executionContext.CancellationToken.IsCancellationRequested)
+                    {
+                        // UnresolvableActionDownloadInfoException is a 422 client error, don't retry.
+                        // NonRetryableActionDownloadInfoException is a non-retryable exception from Actions.
+                        if (ex is WebApi.UnresolvableActionDownloadInfoException)
+                        {
+                            nonRetryableResolveException = ex;
+                            return OperationOutcome.Success(false);
+                        }
+
+                        if (ex is WebApi.NonRetryableActionDownloadInfoException)
+                        {
+                            // This exception will be traced as an infrastructure failure.
+                            nonRetryableResolveException = new WebApi.FailedToResolveActionDownloadInfoException("Failed to resolve action download info.", ex);
+                            return OperationOutcome.Success(false);
+                        }
+
+                        return OperationOutcome.TransientFailure<bool>(ex.Message);
+                    }
+                },
+                cancellationToken: executionContext.CancellationToken);
+
+            if (!resolved)
+            {
+                throw nonRetryableResolveException;
             }
 
             ArgUtil.NotNull(actionDownloadInfos, nameof(actionDownloadInfos));
@@ -1400,115 +1409,132 @@ namespace GitHub.Runner.Worker
         private async Task DownloadRepositoryArchive(IExecutionContext executionContext, string downloadUrl, string downloadAuthToken, string archiveFile)
         {
             Trace.Info($"Save archive '{downloadUrl}' into {archiveFile}.");
-            int retryCount = 0;
+            int attemptNumber = 0;
+            Exception nonRetryableDownloadException = null;
 
             // Allow up to 20 * 60s for any action to be downloaded from github graph.
             int timeoutSeconds = 20 * 60;
             try
             {
-                while (retryCount < 3)
+                var downloadArchiveRetryHelper = new RetryHelper(Trace, new RetryStrategy
                 {
-                    string requestId = string.Empty;
-                    using (var actionDownloadTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds)))
-                    using (var actionDownloadCancellation = CancellationTokenSource.CreateLinkedTokenSource(actionDownloadTimeout.Token, executionContext.CancellationToken))
+                    MaxAttempts = 3,
+                    GetBackoff = (_, _, _) => String.IsNullOrEmpty(Environment.GetEnvironmentVariable("_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF"))
+                        ? BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30))
+                        : TimeSpan.Zero,
+                    OnRetry = (context, _, backoff) =>
                     {
-                        try
+                        if (backoff > TimeSpan.Zero)
                         {
-                            //open zip stream in async mode
-                            using (FileStream fs = new(archiveFile, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: _defaultFileStreamBufferSize, useAsync: true))
-                            using (var httpClientHandler = HostContext.CreateHttpClientHandler())
-                            using (var httpClient = new HttpClient(httpClientHandler))
+                            executionContext.Warning($"Back off {backoff.TotalSeconds} seconds before retry.");
+                        }
+                    },
+                });
+
+                var downloaded = await downloadArchiveRetryHelper.ExecuteAsync<bool>(
+                    operationName: nameof(DownloadRepositoryArchive),
+                    operation: async (context) =>
+                    {
+                        attemptNumber = context.AttemptNumber;
+                        string requestId = string.Empty;
+                        using (var actionDownloadTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds)))
+                        using (var actionDownloadCancellation = CancellationTokenSource.CreateLinkedTokenSource(actionDownloadTimeout.Token, executionContext.CancellationToken))
+                        {
+                            try
                             {
-                                httpClient.DefaultRequestHeaders.Authorization = CreateAuthHeader(executionContext, downloadUrl, downloadAuthToken);
-
-                                httpClient.DefaultRequestHeaders.UserAgent.AddRange(HostContext.UserAgents);
-                                using (var response = await httpClient.GetAsync(downloadUrl))
+                                //open zip stream in async mode
+                                using (FileStream fs = new(archiveFile, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: _defaultFileStreamBufferSize, useAsync: true))
+                                using (var httpClientHandler = HostContext.CreateHttpClientHandler())
+                                using (var httpClient = new HttpClient(httpClientHandler))
                                 {
-                                    requestId = UrlUtil.GetGitHubRequestId(response.Headers);
-                                    if (!string.IsNullOrEmpty(requestId))
-                                    {
-                                        Trace.Info($"Request URL: {downloadUrl} X-GitHub-Request-Id: {requestId} Http Status: {response.StatusCode}");
-                                    }
+                                    httpClient.DefaultRequestHeaders.Authorization = CreateAuthHeader(executionContext, downloadUrl, downloadAuthToken);
 
-                                    if (response.IsSuccessStatusCode)
+                                    httpClient.DefaultRequestHeaders.UserAgent.AddRange(HostContext.UserAgents);
+                                    using (var response = await httpClient.GetAsync(downloadUrl))
                                     {
-                                        using (var result = await response.Content.ReadAsStreamAsync())
+                                        requestId = UrlUtil.GetGitHubRequestId(response.Headers);
+                                        if (!string.IsNullOrEmpty(requestId))
                                         {
-                                            await result.CopyToAsync(fs, _defaultCopyBufferSize, actionDownloadCancellation.Token);
-                                            await fs.FlushAsync(actionDownloadCancellation.Token);
-
-                                            // download succeed, break out the retry loop.
-                                            break;
+                                            Trace.Info($"Request URL: {downloadUrl} X-GitHub-Request-Id: {requestId} Http Status: {response.StatusCode}");
                                         }
-                                    }
-                                    else if (response.StatusCode == HttpStatusCode.NotFound)
-                                    {
-                                        // It doesn't make sense to retry in this case, so just stop
-                                        throw new ActionNotFoundException(new Uri(downloadUrl), requestId);
-                                    }
-                                    else if (response.StatusCode == HttpStatusCode.Forbidden)
-                                    {
-                                        // It doesn't make sense to retry in this case, so just stop
-                                        throw new AccessDeniedException($"Access denied to '{downloadUrl}' ({requestId})");
-                                    }
-                                    else
-                                    {
-                                        // Something else bad happened, let's go to our retry logic
+
+                                        if (response.IsSuccessStatusCode)
+                                        {
+                                            using (var result = await response.Content.ReadAsStreamAsync())
+                                            {
+                                                await result.CopyToAsync(fs, _defaultCopyBufferSize, actionDownloadCancellation.Token);
+                                                await fs.FlushAsync(actionDownloadCancellation.Token);
+                                                return OperationOutcome.Success(true);
+                                            }
+                                        }
+
+                                        if (response.StatusCode == HttpStatusCode.NotFound)
+                                        {
+                                            nonRetryableDownloadException = new ActionNotFoundException(new Uri(downloadUrl), requestId);
+                                            return OperationOutcome.Success(false);
+                                        }
+
+                                        if (response.StatusCode == HttpStatusCode.Forbidden)
+                                        {
+                                            nonRetryableDownloadException = new AccessDeniedException($"Access denied to '{downloadUrl}' ({requestId})");
+                                            return OperationOutcome.Success(false);
+                                        }
+
                                         response.EnsureSuccessStatusCode();
+                                        return OperationOutcome.Success(true);
                                     }
                                 }
                             }
-                        }
-                        catch (OperationCanceledException) when (executionContext.CancellationToken.IsCancellationRequested)
-                        {
-                            Trace.Info("Action download has been cancelled.");
-                            throw;
-                        }
-                        catch (OperationCanceledException ex) when (!executionContext.CancellationToken.IsCancellationRequested && retryCount >= 2)
-                        {
-                            Trace.Info($"Action download final retry timeout after {timeoutSeconds} seconds.");
-                            throw new TimeoutException($"Action '{downloadUrl}' download has timed out. Error: {ex.Message} {requestId}");
-                        }
-                        catch (ActionNotFoundException)
-                        {
-                            Trace.Info($"The action at '{downloadUrl}' does not exist");
-                            throw;
-                        }
-                        catch (AccessDeniedException)
-                        {
-                            Trace.Info($"Access denied to '{downloadUrl}'");
-                            throw;
-                        }
-                        catch (Exception ex) when (retryCount < 2)
-                        {
-                            retryCount++;
-                            Trace.Error($"Fail to download archive '{downloadUrl}' -- Attempt: {retryCount}");
-                            Trace.Error(ex);
-                            if (actionDownloadTimeout.Token.IsCancellationRequested)
+                            catch (OperationCanceledException) when (executionContext.CancellationToken.IsCancellationRequested)
                             {
-                                // action download didn't finish within timeout
-                                executionContext.Warning($"Action '{downloadUrl}' didn't finish download within {timeoutSeconds} seconds. {requestId}");
+                                Trace.Info("Action download has been cancelled.");
+                                throw;
                             }
-                            else
+                            catch (OperationCanceledException ex) when (!executionContext.CancellationToken.IsCancellationRequested && context.AttemptNumber >= context.MaxAttempts)
                             {
-                                executionContext.Warning($"Failed to download action '{downloadUrl}'. Error: {ex.Message} {requestId}");
+                                Trace.Info($"Action download final retry timeout after {timeoutSeconds} seconds.");
+                                nonRetryableDownloadException = new TimeoutException($"Action '{downloadUrl}' download has timed out. Error: {ex.Message} {requestId}");
+                                return OperationOutcome.Success(false);
+                            }
+                            catch (Exception ex)
+                            {
+                                Trace.Error($"Fail to download archive '{downloadUrl}' -- Attempt: {context.AttemptNumber}");
+                                Trace.Error(ex);
+                                if (actionDownloadTimeout.Token.IsCancellationRequested)
+                                {
+                                    // action download didn't finish within timeout
+                                    executionContext.Warning($"Action '{downloadUrl}' didn't finish download within {timeoutSeconds} seconds. {requestId}");
+                                }
+                                else
+                                {
+                                    executionContext.Warning($"Failed to download action '{downloadUrl}'. Error: {ex.Message} {requestId}");
+                                }
+
+                                return OperationOutcome.TransientFailure<bool>(ex.Message);
                             }
                         }
+                    },
+                    cancellationToken: executionContext.CancellationToken);
+
+                if (!downloaded)
+                {
+                    if (nonRetryableDownloadException is ActionNotFoundException)
+                    {
+                        Trace.Info($"The action at '{downloadUrl}' does not exist");
+                    }
+                    else if (nonRetryableDownloadException is AccessDeniedException)
+                    {
+                        Trace.Info($"Access denied to '{downloadUrl}'");
                     }
 
-                    if (String.IsNullOrEmpty(Environment.GetEnvironmentVariable("_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF")))
-                    {
-                        var backOff = BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30));
-                        executionContext.Warning($"Back off {backOff.TotalSeconds} seconds before retry.");
-                        await Task.Delay(backOff);
-                    }
+                    throw nonRetryableDownloadException;
                 }
             }
             catch (Exception ex) when (!(ex is AccessDeniedException) && !(ex is OperationCanceledException) && !executionContext.CancellationToken.IsCancellationRequested)
             {
-                Trace.Error($"Failed to download archive '{downloadUrl}' after {retryCount + 1} attempts.");
+                Trace.Error($"Failed to download archive '{downloadUrl}' after {attemptNumber} attempts.");
                 Trace.Error(ex);
-                throw new FailedToDownloadActionException($"Failed to download archive '{downloadUrl}' after {retryCount + 1} attempts.", ex);
+                throw new FailedToDownloadActionException($"Failed to download archive '{downloadUrl}' after {attemptNumber} attempts.", ex);
             }
 
             ArgUtil.NotNullOrEmpty(archiveFile, nameof(archiveFile));
