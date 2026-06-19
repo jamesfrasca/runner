@@ -778,7 +778,7 @@ namespace GitHub.Runner.Listener.Configuration
             var retryHelper = new RetryHelper(Trace, new RetryStrategy
             {
                 MaxAttempts = 3,
-                GetBackoff = (_, _, _) => BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5)),
+                GetBackoff = RetryBackoffs.Random(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5)),
                 OnRetry = (context, _, backoff) =>
                 {
                     Trace.Error($"Failed to get JIT runner token -- Attempt: {context.AttemptNumber}");
@@ -841,7 +841,7 @@ namespace GitHub.Runner.Listener.Configuration
             var retryHelper = new RetryHelper(Trace, new RetryStrategy
             {
                 MaxAttempts = 3,
-                GetBackoff = (_, _, _) => BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5)),
+                GetBackoff = RetryBackoffs.Random(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5)),
                 OnRetry = (context, _, backoff) =>
                 {
                     Trace.Error($"Failed to get tenant credentials -- Attempt: {context.AttemptNumber}");

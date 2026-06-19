@@ -114,7 +114,7 @@ namespace GitHub.Runner.Common
             var retryHelper = new RetryHelper(Trace, new RetryStrategy
             {
                 MaxAttempts = maxRetryAttemptsCount,
-                GetBackoff = (_, _, _) => BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5)),
+                GetBackoff = RetryBackoffs.Random(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5)),
                 OnRetry = (context, _, backoff) =>
                 {
                     Trace.Error($"{errorMessage} -- Attempt: {context.AttemptNumber}");

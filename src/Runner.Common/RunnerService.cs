@@ -49,7 +49,7 @@ namespace GitHub.Runner.Common
             var retryHelper = new RetryHelper(Trace, new RetryStrategy
             {
                 MaxAttempts = 5,
-                GetBackoff = (_, _, _) => TimeSpan.FromMilliseconds(100),
+                GetBackoff = RetryBackoffs.Fixed(TimeSpan.FromMilliseconds(100)),
                 OnRetry = (context, ex, _) =>
                 {
                     Trace.Info($"Catch exception during connect. {context.MaxAttempts - context.AttemptNumber} attempt left.");
@@ -83,7 +83,7 @@ namespace GitHub.Runner.Common
             var retryHelper = new RetryHelper(Trace, new RetryStrategy
             {
                 MaxAttempts = maxAttempts,
-                GetBackoff = (_, _, _) => BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(15)),
+                GetBackoff = RetryBackoffs.Random(TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(15)),
                 OnRetry = (context, _, backoff) =>
                 {
                     Trace.Warning($"Transient failure during request, retrying. Attempt {context.AttemptNumber}/{context.MaxAttempts}. Back off {backoff.TotalSeconds} seconds.");
