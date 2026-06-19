@@ -77,7 +77,7 @@ namespace GitHub.Runner.Common.Tests
                 var helper = new RetryHelper(trace, strategy);
 
                 await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                    helper.ExecuteAsync<int>(() => throw new InvalidOperationException("always fails")));
+                    helper.ExecuteAsync<int>(() => Task.FromException<int>(new InvalidOperationException("always fails"))));
             }
         }
 
@@ -116,21 +116,34 @@ namespace GitHub.Runner.Common.Tests
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", "Common")]
-        public async Task ExecuteAsync_StopsRetryingWhenShouldRetryReturnsFalse()
+        public async Task ExecuteAsync_WithOutcome_PermanentFailurePropagatesImmediately()
         {
             using (TestHostContext hc = CreateTestContext())
             {
                 var trace = hc.GetTrace();
+                var calls = 0;
                 var strategy = new RetryStrategy
                 {
                     MaxAttempts = 5,
                     GetBackoff = (_, _, _) => TimeSpan.Zero,
-                    ShouldRetry = ex => ex is InvalidOperationException,
                 };
                 var helper = new RetryHelper(trace, strategy);
 
+                // Throwing directly from an outcome-based operation propagates immediately without retrying
                 await Assert.ThrowsAsync<ArgumentException>(() =>
-                    helper.ExecuteAsync<int>(() => throw new ArgumentException("non-retryable")));
+                    helper.ExecuteAsync<int>(
+                        "permanent-failure-op",
+                        () =>
+                        {
+                            calls++;
+                            if (calls == 1)
+                            {
+                                return Task.FromResult<OperationOutcome<int>>(new OperationOutcome<int>.TransientFailure("first attempt transient"));
+                            }
+                            throw new ArgumentException("permanent on second attempt");
+                        }));
+
+                Assert.Equal(2, calls);
             }
         }
 
@@ -229,7 +242,7 @@ namespace GitHub.Runner.Common.Tests
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", "Common")]
-        public async Task ExecuteAsync_InvokesOnFailureForNonRetryableException()
+        public async Task ExecuteAsync_InvokesOnFailureWhenRetriesExhausted()
         {
             using (TestHostContext hc = CreateTestContext())
             {
@@ -239,9 +252,8 @@ namespace GitHub.Runner.Common.Tests
                 TimeSpan capturedDuration = TimeSpan.Zero;
                 var strategy = new RetryStrategy
                 {
-                    MaxAttempts = 5,
+                    MaxAttempts = 2,
                     GetBackoff = (_, _, _) => TimeSpan.Zero,
-                    ShouldRetry = ex => ex is InvalidOperationException,
                     OnFailure = (context, ex, duration) =>
                     {
                         capturedContext = context;
@@ -253,11 +265,12 @@ namespace GitHub.Runner.Common.Tests
                 var helper = new RetryHelper(trace, strategy);
 
                 await Assert.ThrowsAsync<ArgumentException>(() =>
-                    helper.ExecuteAsync<int>("non-retryable-op", () => throw new ArgumentException("fail")));
+                    helper.ExecuteAsync<int>("exhausted-op",
+                        () => Task.FromException<int>(new ArgumentException("fail"))));
 
                 Assert.NotNull(capturedContext);
-                Assert.Equal("non-retryable-op", capturedContext.OperationName);
-                Assert.Equal(1, capturedContext.AttemptNumber);
+                Assert.Equal("exhausted-op", capturedContext.OperationName);
+                Assert.Equal(2, capturedContext.AttemptNumber);
                 Assert.IsType<ArgumentException>(capturedException);
                 Assert.True(capturedDuration >= TimeSpan.Zero);
             }
@@ -292,6 +305,120 @@ namespace GitHub.Runner.Common.Tests
 
                 Assert.Equal(3, result);
                 Assert.Equal(new[] { 1, 2, 3 }, seenAttempts);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public async Task ExecuteAsync_WithOutcome_SucceedsOnFirstAttempt()
+        {
+            using (TestHostContext hc = CreateTestContext())
+            {
+                var trace = hc.GetTrace();
+                var strategy = new RetryStrategy
+                {
+                    MaxAttempts = 3,
+                    GetBackoff = (_, _, _) => TimeSpan.Zero,
+                };
+                var helper = new RetryHelper(trace, strategy);
+
+                var result = await helper.ExecuteAsync<int>(
+                    "outcome-op",
+                    () => Task.FromResult<OperationOutcome<int>>(new OperationOutcome<int>.Success(99)));
+
+                Assert.Equal(99, result);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public async Task ExecuteAsync_WithOutcome_RetriesOnTransientFailure()
+        {
+            using (TestHostContext hc = CreateTestContext())
+            {
+                var trace = hc.GetTrace();
+                var calls = 0;
+                var strategy = new RetryStrategy
+                {
+                    MaxAttempts = 3,
+                    GetBackoff = (_, _, _) => TimeSpan.Zero,
+                };
+                var helper = new RetryHelper(trace, strategy);
+
+                var result = await helper.ExecuteAsync<int>(
+                    "outcome-op",
+                    () =>
+                    {
+                        calls++;
+                        if (calls < 3)
+                        {
+                            return Task.FromResult<OperationOutcome<int>>(new OperationOutcome<int>.TransientFailure("not ready yet"));
+                        }
+                        return Task.FromResult<OperationOutcome<int>>(new OperationOutcome<int>.Success(calls));
+                    });
+
+                Assert.Equal(3, result);
+                Assert.Equal(3, calls);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public async Task ExecuteAsync_WithOutcome_ThrowsAfterMaxTransientFailures()
+        {
+            using (TestHostContext hc = CreateTestContext())
+            {
+                var trace = hc.GetTrace();
+                var strategy = new RetryStrategy
+                {
+                    MaxAttempts = 3,
+                    GetBackoff = (_, _, _) => TimeSpan.Zero,
+                };
+                var helper = new RetryHelper(trace, strategy);
+
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                    helper.ExecuteAsync<int>(
+                        "outcome-op",
+                        () => Task.FromResult<OperationOutcome<int>>(new OperationOutcome<int>.TransientFailure("always failing"))));
+
+                Assert.Contains("always failing", ex.Message);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public async Task ExecuteAsync_WithOutcome_InvokesOnRetryCallback()
+        {
+            using (TestHostContext hc = CreateTestContext())
+            {
+                var trace = hc.GetTrace();
+                var onRetryCalls = 0;
+                var strategy = new RetryStrategy
+                {
+                    MaxAttempts = 3,
+                    GetBackoff = (_, _, _) => TimeSpan.Zero,
+                    OnRetry = (_, _, _) => onRetryCalls++,
+                };
+                var helper = new RetryHelper(trace, strategy);
+                var calls = 0;
+
+                await helper.ExecuteAsync<int>(
+                    "outcome-op",
+                    () =>
+                    {
+                        calls++;
+                        if (calls < 3)
+                        {
+                            return Task.FromResult<OperationOutcome<int>>(new OperationOutcome<int>.TransientFailure("not ready"));
+                        }
+                        return Task.FromResult<OperationOutcome<int>>(new OperationOutcome<int>.Success(calls));
+                    });
+
+                Assert.Equal(2, onRetryCalls);
             }
         }
 

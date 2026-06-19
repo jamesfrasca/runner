@@ -775,21 +775,18 @@ namespace GitHub.Runner.Listener.Configuration
                 throw new ArgumentException($"'{githubUrl}' should point to an org or repository.");
             }
 
-            var responseStatus = System.Net.HttpStatusCode.OK;
             var retryHelper = new RetryHelper(Trace, new RetryStrategy
             {
                 MaxAttempts = 3,
-                ShouldRetry = _ => responseStatus != System.Net.HttpStatusCode.NotFound,
                 GetBackoff = (_, _, _) => BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5)),
-                OnRetry = (context, ex, backoff) =>
+                OnRetry = (context, _, backoff) =>
                 {
                     Trace.Error($"Failed to get JIT runner token -- Attempt: {context.AttemptNumber}");
-                    Trace.Error(ex);
                     Trace.Info($"Retrying in {backoff.Seconds} seconds");
                 },
             });
 
-            return await retryHelper.ExecuteAsync(
+            return await retryHelper.ExecuteAsync<GitHubRunnerRegisterToken>(
                 operationName: "GetJITRunnerTokenAsync",
                 operation: async () =>
                 {
@@ -803,24 +800,27 @@ namespace GitHub.Runner.Listener.Configuration
                         httpClient.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github.v3+json");
 
                         var response = await httpClient.PostAsync(githubApiUrl, new StringContent(string.Empty));
-                        responseStatus = response.StatusCode;
                         var githubRequestId = UrlUtil.GetGitHubRequestId(response.Headers);
 
                         if (response.IsSuccessStatusCode)
                         {
                             Trace.Info($"Http response code: {response.StatusCode} from 'POST {githubApiUrl}' ({githubRequestId})");
                             var jsonResponse = await response.Content.ReadAsStringAsync();
-                            return StringUtil.ConvertFromJson<GitHubRunnerRegisterToken>(jsonResponse);
+                            return OperationOutcome.Success(StringUtil.ConvertFromJson<GitHubRunnerRegisterToken>(jsonResponse));
                         }
                         else
                         {
                             _term.WriteError($"Http response code: {response.StatusCode} from 'POST {githubApiUrl}' (Request Id: {githubRequestId})");
                             var errorResponse = await response.Content.ReadAsStringAsync();
                             _term.WriteError(errorResponse);
-                            response.EnsureSuccessStatusCode();
-                        }
 
-                        throw new InvalidOperationException($"Unable to process response from 'POST {githubApiUrl}'.");
+                            if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                            {
+                                response.EnsureSuccessStatusCode();
+                            }
+
+                            return OperationOutcome.TransientFailure<GitHubRunnerRegisterToken>($"Http response code: {response.StatusCode} from 'POST {githubApiUrl}'");
+                        }
                     }
                 });
         }
@@ -838,16 +838,13 @@ namespace GitHub.Runner.Listener.Configuration
                 githubApiUrl = $"{gitHubUrlBuilder.Scheme}://{gitHubUrlBuilder.Host}/api/v3/actions/runner-registration";
             }
 
-            var responseStatus = System.Net.HttpStatusCode.OK;
             var retryHelper = new RetryHelper(Trace, new RetryStrategy
             {
                 MaxAttempts = 3,
-                ShouldRetry = _ => responseStatus != System.Net.HttpStatusCode.NotFound,
                 GetBackoff = (_, _, _) => BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5)),
-                OnRetry = (context, ex, backoff) =>
+                OnRetry = (context, _, backoff) =>
                 {
                     Trace.Error($"Failed to get tenant credentials -- Attempt: {context.AttemptNumber}");
-                    Trace.Error(ex);
                     Trace.Info($"Retrying in {backoff.Seconds} seconds");
                 },
             });
@@ -858,7 +855,7 @@ namespace GitHub.Runner.Listener.Configuration
                 {"runner_event", runnerEvent}
             };
 
-            return await retryHelper.ExecuteAsync(
+            return await retryHelper.ExecuteAsync<GitHubAuthResult>(
                 operationName: "GetTenantCredential",
                 operation: async () =>
                 {
@@ -869,24 +866,27 @@ namespace GitHub.Runner.Listener.Configuration
                         httpClient.DefaultRequestHeaders.UserAgent.AddRange(HostContext.UserAgents);
 
                         var response = await httpClient.PostAsync(githubApiUrl, new StringContent(StringUtil.ConvertToJson(bodyObject), null, "application/json"));
-                        responseStatus = response.StatusCode;
                         var githubRequestId = UrlUtil.GetGitHubRequestId(response.Headers);
 
                         if (response.IsSuccessStatusCode)
                         {
                             Trace.Info($"Http response code: {response.StatusCode} from 'POST {githubApiUrl}' ({githubRequestId})");
                             var jsonResponse = await response.Content.ReadAsStringAsync();
-                            return StringUtil.ConvertFromJson<GitHubAuthResult>(jsonResponse);
+                            return OperationOutcome.Success(StringUtil.ConvertFromJson<GitHubAuthResult>(jsonResponse));
                         }
                         else
                         {
                             _term.WriteError($"Http response code: {response.StatusCode} from 'POST {githubApiUrl}' (Request Id: {githubRequestId})");
                             var errorResponse = await response.Content.ReadAsStringAsync();
                             _term.WriteError(errorResponse);
-                            response.EnsureSuccessStatusCode();
-                        }
 
-                        throw new InvalidOperationException($"Unable to process response from 'POST {githubApiUrl}'.");
+                            if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                            {
+                                response.EnsureSuccessStatusCode();
+                            }
+
+                            return OperationOutcome.TransientFailure<GitHubAuthResult>($"Http response code: {response.StatusCode} from 'POST {githubApiUrl}'");
+                        }
                     }
                 });
         }

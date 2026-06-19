@@ -67,40 +67,30 @@ namespace GitHub.Runner.Common
                 });
         }
 
-        protected async Task RetryRequest(Func<Task> func,
+        protected async Task RetryRequest(Func<Task<OperationOutcome<bool>>> func,
             CancellationToken cancellationToken,
-            int maxAttempts = 5,
-            Func<Exception, bool> shouldRetry = null
+            int maxAttempts = 5
         )
         {
-            async Task<Unit> wrappedFunc()
-            {
-                await func();
-                return Unit.Value;
-            }
-            await RetryRequest<Unit>(wrappedFunc, cancellationToken, maxAttempts, shouldRetry);
+            await RetryRequest<bool>(func, cancellationToken, maxAttempts);
         }
 
-        protected async Task<T> RetryRequest<T>(Func<Task<T>> func,
+        protected async Task<T> RetryRequest<T>(Func<Task<OperationOutcome<T>>> func,
             CancellationToken cancellationToken,
-            int maxAttempts = 5,
-            Func<Exception, bool> shouldRetry = null
+            int maxAttempts = 5
         )
         {
             var retryHelper = new RetryHelper(Trace, new RetryStrategy
             {
                 MaxAttempts = maxAttempts,
-                ShouldRetry = shouldRetry,
                 GetBackoff = (_, _, _) => BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(15)),
-                OnRetry = (context, ex, backoff) =>
+                OnRetry = (context, _, backoff) =>
                 {
-                    Trace.Error("Catch exception during request");
-                    Trace.Error(ex);
-                    Trace.Warning($"Back off {backoff.TotalSeconds} seconds before next retry. {context.MaxAttempts - context.AttemptNumber} attempt left.");
+                    Trace.Warning($"Transient failure during request, retrying. Attempt {context.AttemptNumber}/{context.MaxAttempts}. Back off {backoff.TotalSeconds} seconds.");
                 },
             });
 
-            return await retryHelper.ExecuteAsync(func, cancellationToken);
+            return await retryHelper.ExecuteAsync<T>("RetryRequest", func, cancellationToken);
         }
     }
 }

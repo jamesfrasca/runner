@@ -126,7 +126,7 @@ namespace GitHub.Runner.Common.Tests.Listener
                 var server = new RunnerDotcomServer();
                 server.Initialize(hc);
 
-                await Assert.ThrowsAsync<HttpRequestException>(() => server.GetRunnerByNameAsync("https://github.com/my-org", "token", "runner-a"));
+                await Assert.ThrowsAsync<InvalidOperationException>(() => server.GetRunnerByNameAsync("https://github.com/my-org", "token", "runner-a"));
 
                 mockHandler.Protected().Verify(
                     "SendAsync",

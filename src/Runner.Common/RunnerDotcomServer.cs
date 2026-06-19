@@ -111,21 +111,18 @@ namespace GitHub.Runner.Common
 
         private async Task<T> RetryRequest<T>(string githubApiUrl, string githubToken, RequestType requestType, int maxRetryAttemptsCount = 5, string errorMessage = null, StringContent body = null)
         {
-            var responseStatus = System.Net.HttpStatusCode.OK;
             var retryHelper = new RetryHelper(Trace, new RetryStrategy
             {
                 MaxAttempts = maxRetryAttemptsCount,
-                ShouldRetry = _ => responseStatus != System.Net.HttpStatusCode.NotFound,
                 GetBackoff = (_, _, _) => BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5)),
-                OnRetry = (context, ex, backoff) =>
+                OnRetry = (context, _, backoff) =>
                 {
                     Trace.Error($"{errorMessage} -- Attempt: {context.AttemptNumber}");
-                    Trace.Error(ex);
                     Trace.Info($"Retrying in {backoff.Seconds} seconds");
                 },
             });
 
-            return await retryHelper.ExecuteAsync(
+            return await retryHelper.ExecuteAsync<T>(
                 operationName: "RunnerDotcomServer.RetryRequest",
                 operation: async () =>
                 {
@@ -156,21 +153,26 @@ namespace GitHub.Runner.Common
 
                         if (response != null)
                         {
-                            responseStatus = response.StatusCode;
                             var githubRequestId = UrlUtil.GetGitHubRequestId(response.Headers);
 
                             if (response.IsSuccessStatusCode)
                             {
                                 Trace.Info($"Http response code: {response.StatusCode} from '{requestType.ToString()} {githubApiUrl}' ({githubRequestId})");
                                 var jsonResponse = await response.Content.ReadAsStringAsync();
-                                return StringUtil.ConvertFromJson<T>(jsonResponse);
+                                return OperationOutcome.Success(StringUtil.ConvertFromJson<T>(jsonResponse));
                             }
                             else
                             {
                                 _term.WriteError($"Http response code: {response.StatusCode} from '{requestType.ToString()} {githubApiUrl}' (Request Id: {githubRequestId})");
                                 var errorResponse = await response.Content.ReadAsStringAsync();
                                 _term.WriteError(errorResponse);
-                                response.EnsureSuccessStatusCode();
+
+                                if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                                {
+                                    response.EnsureSuccessStatusCode();
+                                }
+
+                                return OperationOutcome.TransientFailure<T>($"Http response code: {response.StatusCode} from '{requestType} {githubApiUrl}'");
                             }
                         }
 
